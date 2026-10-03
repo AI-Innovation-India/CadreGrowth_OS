@@ -286,7 +286,7 @@ Diagram, invariants and the development workflow: **[`docs/architecture.md`](./d
 > that decrypts your stored credentials, and `POSTGRES_PASSWORD` is applied only when Postgres first
 > creates its data directory. See [backups](./docs/install.md#backups--what-you-must-keep).
 
-**Found a vulnerability?** Report it privately to <security@example.com> rather than opening a
+**Found a vulnerability?** Report it privately to <dineshinnovationai@gmail.com> rather than opening a
 public issue — [`SECURITY.md`](./SECURITY.md) has the scope and what to expect.
 
 ---

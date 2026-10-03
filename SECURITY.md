@@ -22,7 +22,7 @@ re-run and leaves `.env` and your database alone:
 
 ## Reporting a vulnerability
 
-**Email <security@example.com>** with `SECURITY` in the subject line.
+**Email <dineshinnovationai@gmail.com>** with `SECURITY` in the subject line.
 
 Please do **not** open a public issue, pull request or discussion for a suspected vulnerability.
 A public report is readable by everyone running this software before any of them can patch.
