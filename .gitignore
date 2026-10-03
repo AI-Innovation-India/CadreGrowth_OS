@@ -1,0 +1,84 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+build/
+**/dist/
+**/build/
+*.tgz
+# …except /dist/cadre-growth-*.zip. That one is not build output, it is a
+# SHIPPED file: the install bundle a customer downloads. It lives in the repo so
+# raw.githubusercontent can serve it when the releases page is the thing that is
+# unreachable — the same reason install.sh keeps a local copy of files it fails
+# to download. Three lines rather than one because git cannot re-include a file
+# whose parent directory is excluded: the directory has to come back first, then
+# its contents go out again, then the zip comes back.
+!/dist/
+/dist/*
+!/dist/cadre-growth-*.zip
+
+# Environment & secrets — NEVER commit
+.env
+.env.local
+.env.production
+.env.*.local
+**/.env
+!.env.example
+!**/.env.example
+
+# Runtime data (mounted as docker volumes in prod)
+backend/uploads/
+backend/media/
+uploads/
+media/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Coverage & cache
+coverage/
+.nyc_output/
+.cache/
+.parcel-cache/
+.vite/
+
+# Temp / scratch
+*.tmp
+*.bak
+/tmp/
+scratch/
+
+# PDFs / large generated artifacts
+CadreCRM_LLD.html
+*.pdf
+# …except documentation we ship. This rule exists to keep stray exports and
+# scratch renders out of the repo, and it silently swallowed the installation
+# guide too — `git add` reported nothing and the commit went through with only
+# the README that links to it. Anything under docs/ is deliberate.
+!docs/*.pdf
+
+# Local Claude memory (machine-specific)
+.claude/
+
+# Backups
+*.dump
+*.sql.gz
+*.backup
+
+# Local stack state
+.env

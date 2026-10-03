@@ -1,0 +1,12 @@
+{
+  "//": "Cadre Growth OS remote MCP connector. The address below is filled in with your own instance's when you download this plugin from Admin Settings -> MCP Tools, so there is normally nothing to edit. If you took this folder from the repository instead, replace https://YOUR-CADRE-GROWTH-HOST with the address you open Cadre Growth OS at — scheme included, since a local install is served over http.",
+  "//same-address": "It must be the SAME address you sign in at. The server issues the OAuth token for the host the request arrives on, so a connector pointed at a second domain that reaches the same install gets a token for one address and spends it against another — which the client reports as a credentials problem and is not one.",
+  "//host": "Avoid a hostname behind a proxy that challenges datacenter traffic. A CDN/WAF in front of this app can pass OAuth discovery and the token exchange and then silently drop the authenticated MCP request, which again looks exactly like a credentials problem.",
+  "//legacy": "The older key-in-URL form (https://<host>/api/mcp/http/<KEY>) still works for clients that do not speak OAuth, but it puts a long-lived credential into a URL that ends up in shell history, proxy logs and referrer headers. Prefer the OAuth URL above.",
+  "mcpServers": {
+    "cadre-growth": {
+      "type": "http",
+      "url": "https://YOUR-CADRE-GROWTH-HOST/api/mcp"
+    }
+  }
+}

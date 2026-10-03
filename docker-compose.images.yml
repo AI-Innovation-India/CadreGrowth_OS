@@ -1,0 +1,205 @@
+# Cadre Growth OS — run from published images, with NO source code on the machine.
+#
+# You do not fetch this file yourself. The installer downloads it, writes a .env
+# with every secret generated, and starts the stack:
+#
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/AI-Innovation-India/CadreGrowth_OS/main/scripts/install.sh)"
+#
+# Add `-- --domain crm.example.com` for HTTPS, and it asks nothing at all.
+# Re-running the install.sh it leaves behind is the upgrade.
+#
+# By hand instead, if you would rather see every step: download this file as
+# docker-compose.yml, .env.example as .env, caddy/Caddyfile, up.sh and down.sh,
+# then fill in the five empty values in .env — POSTGRES_PASSWORD,
+# MINIO_ROOT_PASSWORD, CADRECRM_JWT_SECRET, CADRECRM_ENCRYPTION_KEY (32-byte
+# hex) and META_WEBHOOK_VERIFY_TOKEN — and run ./up.sh. The admin password is
+# then printed once, in the log:
+#
+#   docker compose logs backend | grep -A5 "FIRST-RUN ADMIN"
+#
+# Start and stop with ./up.sh and ./down.sh, not with `docker compose` directly.
+# They are not conveniences: up.sh fetches the page a browser will really load
+# (five healthy containers and a 404 look identical from inside), and both
+# refuse to run when another install on this machine already owns this one's
+# name — the failure that otherwise ends with two installs sharing one database.
+#
+# The backend applies its own migrations at startup (they are baked into the
+# image), so there is no migrate step and no psql needed on the host.
+#
+# ⚠ Only the web frontend publishes a host port. Postgres, Redis and MinIO stay
+#   on the internal network — exposing a database to the internet is the single
+#   most common way a self-hosted deployment gets compromised.
+#
+# To pin a version instead of tracking latest, set CADREGROWTH_TAG in .env.
+#
+# Memory ceilings default to a total of ~1.5 GB so this can share a small server
+# without starving whatever else runs there. Raise them in .env on a bigger box;
+# the defaults are a floor that works, not a recommendation. A container that
+# reaches its ceiling is killed and restarted, so a limit set below what the
+# service really needs shows up as a container that restarts forever.
+
+name: cadregrowth
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # Comfortably above the 128 MB default shared_buffers. If you raise
+    # shared_buffers, raise this first — Postgres does not check it can fit.
+    mem_limit: ${POSTGRES_MEM_LIMIT:-512m}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cadregrowth}
+      POSTGRES_USER: ${POSTGRES_USER:-cadregrowth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # depends_on alone only waits for the container to START; Postgres accepts
+      # connections seconds later.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cadregrowth} -d ${POSTGRES_DB:-cadregrowth}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: ${REDIS_MEM_LIMIT:-128m}
+    # AOF on: a queued-but-unsent WhatsApp message should survive a restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    mem_limit: ${MINIO_MEM_LIMIT:-256m}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-cadregrowth}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    # The service name is load-bearing: the web image's nginx config proxies to
+    # the literal host `backend:3013`. Renaming this service 502s the whole UI.
+    image: ghcr.io/ai-innovation-india/cadregrowth-backend:${CADREGROWTH_TAG:-latest}
+    restart: unless-stopped
+    # The one to raise first. Node's heap grows with concurrent agent runs and
+    # media handling; a busy install wants 1g.
+    mem_limit: ${BACKEND_MEM_LIMIT:-512m}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      minio:    { condition: service_healthy }
+    env_file: [.env]
+    environment:
+      # Pinned here rather than left to .env: these must match the service names
+      # on this network, and a stale hand-edited value fails as "connection
+      # refused" against a host that does not exist.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: "9000"
+      PORT: "3013"
+      NODE_ENV: production
+      # Set to 0 if migrations are applied by something else.
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-1}
+      # Optional: let this install publish its own routes to a reverse proxy that
+      # already owns ports 80/443, so a domain added in Admin Settings -> Domain
+      # needs no shell. BOTH must be set or the feature stays off — a guessed
+      # directory is either useless or writes into somebody else's proxy, and
+      # neither failure announces itself. See docs/reverse-proxy.md.
+      TRAEFIK_DYNAMIC_DIR: ${TRAEFIK_DYNAMIC_DIR:-}
+      PROXY_UPSTREAM: ${PROXY_UPSTREAM:-}
+    volumes:
+      # The route directory for the optional auto-routing above is NOT mounted
+      # here. It is server-specific — the path exists only on a machine whose
+      # reverse proxy watches it — and it belongs in the same overlay that adds
+      # the proxy's own flags, so the two halves cannot drift apart. See
+      # docs/reverse-proxy.md for a complete one.
+      - uploads:/app/uploads   # team profile pictures
+      - media:/app/media       # downloaded WhatsApp media
+      # No plugin bind-mount here, unlike the build-from-source compose: the
+      # plugin is baked into the image precisely so this path needs no repo.
+
+  web:
+    image: ghcr.io/ai-innovation-india/cadregrowth-web:${CADREGROWTH_TAG:-latest}
+    restart: unless-stopped
+    # Static files through nginx — it does not need more than this.
+    mem_limit: ${WEB_MEM_LIMIT:-64m}
+    depends_on: [backend]
+    ports:
+      # WEB_BIND is 0.0.0.0 unless TLS is on, when install.sh sets it to
+      # 127.0.0.1: with caddy terminating in front, the plain-HTTP port should
+      # not also be reachable from outside — otherwise the site is served twice,
+      # once without a certificate.
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8080}:80"
+
+  # HTTPS for a public domain. Off unless COMPOSE_PROFILES=tls, which
+  # `install.sh --domain <host>` writes into .env — so every later
+  # `docker compose up -d` keeps it on without remembering a flag.
+  #
+  # Caddy is here rather than Traefik or nginx because a certificate is the
+  # whole job: given a domain it obtains and renews one from Let's Encrypt with
+  # no configuration, no resolver to define and no acme.json to create. On a
+  # server that ALREADY runs a reverse proxy, leave this off and point that
+  # proxy at WEB_PORT instead.
+  #
+  # ⚠ Ports 80 and 443 must be free and reachable from the internet: the
+  # certificate is issued by a challenge that Let's Encrypt makes to this host
+  # over port 80. install.sh checks both before starting.
+  #
+  # ⚠ Unlike every other service here, this one needs a file on disk:
+  # ./caddy/Caddyfile. install.sh downloads it. If it is missing, Docker creates
+  # a DIRECTORY at that path and Caddy fails with "is a directory" — which is
+  # why install.sh and up.sh both check for it before starting.
+  caddy:
+    image: caddy:2-alpine
+    profiles: [tls]
+    restart: unless-stopped
+    mem_limit: ${CADDY_MEM_LIMIT:-64m}
+    depends_on: [web]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Consumed by ./caddy/Caddyfile.
+      #
+      # ⚠ Plain defaults, NOT `${TLS_DOMAIN:?...}`. Compose interpolates every
+      # service when it loads the file — including ones whose profile is off —
+      # so a required-variable marker here would break `docker compose up` for
+      # everybody who never asked for HTTPS. Both values are always written by
+      # `install.sh --domain`; setting the profile by hand without them is what
+      # the fallback below reports.
+      TLS_DOMAIN: ${TLS_DOMAIN:-tls-domain-not-set.invalid}
+      # An email address gets a real Let's Encrypt certificate; the word
+      # "internal" self-signs instead, for a domain with no public DNS.
+      TLS_EMAIL: ${TLS_EMAIL:-internal}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates live here. Without this volume every recreate re-issues,
+      # and Let's Encrypt rate-limits that to five per week per domain.
+      - caddydata:/data
+      - caddyconfig:/config
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  uploads:
+  media:
+  caddydata:
+  caddyconfig:

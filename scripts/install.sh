@@ -1,0 +1,1517 @@
+#!/usr/bin/env bash
+# ─── Cadre Growth OS — one-command install ──────────────────────────────────────
+#
+# On a fresh server, with nothing checked out:
+#
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/AI-Innovation-India/CadreGrowth_OS/main/scripts/install.sh)"
+#
+# From a source checkout:
+#
+#   ./scripts/install.sh
+#
+# Both paths end the same way: a .env with every secret generated, the stack
+# running, and the address people will actually type verified by fetching it.
+# The only difference is where the images come from — published ones are pulled,
+# a checkout is built. Neither asks anyone to edit .env by hand.
+#
+# Safe to re-run, and re-running IS the upgrade. An existing .env is never
+# overwritten (only empty or placeholder values are filled in); the compose file
+# and helper scripts are re-downloaded every time.
+#
+# The flag list lives in usage() below rather than in this header. A header
+# printed by `sed -n … "$0"` cannot work when the script arrived down a pipe and
+# $0 is not a file — which is exactly how the headline command above runs it.
+#
+set -euo pipefail
+
+# ── output helpers ───────────────────────────────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; N=$'\033[0m'
+else
+  B=''; DIM=''; R=''; G=''; Y=''; N=''
+fi
+step() { printf '\n%s==>%s %s%s%s\n' "$B" "$N" "$B" "$1" "$N"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$1"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$1"; }
+die()  { printf '\n%sInstall failed:%s %s\n\n' "$R" "$N" "$1" >&2; exit 1; }
+
+# ── usage ────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<'EOF'
+Cadre Growth OS installer. Run it with no flags and it asks one question.
+
+Address — the only thing it genuinely needs to know:
+  --domain <host>       Serve HTTPS on this domain, with a Let's Encrypt
+                        certificate obtained and renewed automatically. Needs
+                        ports 80 and 443 free, and the domain's DNS already
+                        pointing at this machine.
+  --url <origin>        Public origin when something else terminates HTTPS —
+                        your own reverse proxy in front of this stack.
+  --port <n>            Host port for the web UI (default 8080, or the next
+                        free one if that is taken).
+
+Where it installs from:
+  --images              Published images; nothing is built. The default when
+                        there is no source checkout around this script.
+  --source              Build from the checkout this script lives in.
+  --dir <path>          Install into this directory rather than ./cadre-growth.
+  --version <ref>       Pin the downloaded files AND the image tag together,
+                        e.g. --version v1.4.0 (1.4.0 works too). Sticky: later
+                        runs stay on it until you pass a different one.
+
+Accounts and certificates:
+  --admin-email <addr>  First-run admin (default: admin@<your domain>).
+  --admin-password <pw> First-run admin password (default: generated, printed).
+  --tls-email <addr>    Certificate contact (default: the admin email). The
+                        word "internal" self-signs instead of asking Let's
+                        Encrypt, for a domain with no public DNS.
+
+Other:
+  --no-build            Skip the image build (source installs only).
+  --proxy-routes <dir>  For a server whose reverse proxy already owns 80/443:
+                        publish routes into <dir>, which that proxy watches, so
+                        domains added in Admin Settings -> Domain need no shell.
+                        The proxy container and its network are detected. Set up
+                        the proxy's own side once first — docs/reverse-proxy.md.
+  --yes, -y             Never ask. With no address flag it takes this machine's
+                        own public address when it has one, and localhost when it
+                        does not (behind NAT, or a laptop).
+  --help, -h            This text.
+EOF
+}
+
+# ── arguments ────────────────────────────────────────────────────────────────
+WEB_PORT=''; PUBLIC_URL=''; ADMIN_EMAIL=''; ADMIN_PASSWORD=''
+# A second accepted browser origin, set only where the address given is genuinely
+# ambiguous about its port. Empty in every other case. See the proxy branch of
+# the derived-address block.
+CORS_EXTRA=''
+DOMAIN=''; TLS_EMAIL=''
+ASSUME_YES=0; DO_BUILD=1
+MODE=''; INSTALL_DIR=''; PIN_REF=''; PROXY_ROUTES=''
+# Set when a download failed and an existing local copy was used instead.
+# Reported at the end of the download step: those files may be older than
+# the images about to be pulled, which is the one thing worth saying.
+FETCH_FELL_BACK=0
+# --url and --domain both name the address, but they mean opposite things about
+# who terminates TLS, so which one was used has to survive into the logic.
+URL_GIVEN=0
+
+# `--flag` with nothing after it used to `shift 2` off the end, which under
+# `set -u` surfaces as an internal error about $2 rather than as the missing
+# argument it is.
+need_arg() {
+  if [ $# -lt 2 ] || [ -z "$2" ]; then die "$1 needs a value (try --help)"; fi
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port)           need_arg "$@"; WEB_PORT="$2"; shift 2 ;;
+    --domain)         need_arg "$@"; DOMAIN="$2"; shift 2 ;;
+    --tls-email)      need_arg "$@"; TLS_EMAIL="$2"; shift 2 ;;
+    --url)            need_arg "$@"; PUBLIC_URL="$2"; URL_GIVEN=1; shift 2 ;;
+    --admin-email)    need_arg "$@"; ADMIN_EMAIL="$2"; shift 2 ;;
+    --admin-password) need_arg "$@"; ADMIN_PASSWORD="$2"; shift 2 ;;
+    --dir)            need_arg "$@"; INSTALL_DIR="$2"; shift 2 ;;
+    --version)        need_arg "$@"; PIN_REF="$2"; shift 2 ;;
+    --images)         MODE=images; shift ;;
+    --source)         MODE=source; shift ;;
+    --no-build)       DO_BUILD=0; shift ;;
+    --proxy-routes)   need_arg "$@"; PROXY_ROUTES="$2"; shift 2 ;;
+    -y|--yes)         ASSUME_YES=1; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    *)                die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+# ── source checkout, or published images? ────────────────────────────────────
+#
+# A checkout is provable: three things must be present. Its ABSENCE is not
+# provable, so images is the default — a piped run in somebody's home directory
+# must not conclude it is a checkout and try to build a tree that is not there.
+looks_like_checkout() {
+  [ -n "$1" ] && [ -f "$1/docker-compose.yml" ] \
+              && [ -f "$1/backend/Dockerfile" ] \
+              && [ -d "$1/supabase/migrations" ]
+}
+
+# `CDPATH= cd` blanks CDPATH for that one command. Without it, a CDPATH set in
+# the caller's shell can make `cd` land somewhere else entirely and this would
+# configure the wrong directory. Deliberate, not the typo it resembles.
+script_parent=''
+if [ -f "$0" ]; then
+  # shellcheck disable=SC1007
+  script_parent=$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd) || script_parent=''
+fi
+
+if [ -z "$MODE" ]; then
+  # $0 is a real file only when this script was saved to disk. Under
+  # `bash -c "$(curl …)"` it is "--", and nothing sits above that — which is
+  # exactly what separates the two paths.
+  if   looks_like_checkout "$script_parent"; then MODE=source
+  elif looks_like_checkout "$PWD";           then MODE=source
+  else MODE=images
+  fi
+fi
+
+# ── where the install lives ──────────────────────────────────────────────────
+if [ "$MODE" = source ]; then
+  # ⚠ --dir has no meaning here and must not be quietly dropped. A source install
+  #   builds the checkout it lives in, so `--source --dir /somewhere/else` cannot
+  #   do what it says — and the install it DOES perform lands on the checkout,
+  #   which on a machine where that checkout is a running service means editing a
+  #   live install's .env while believing a throwaway one was created. Every
+  #   symptom then points at the throwaway directory, which is empty.
+  if [ -n "$INSTALL_DIR" ]; then
+    die "--dir does not apply with --source: a source install builds the checkout
+  this script lives in, and cannot be placed elsewhere.
+
+  To install somewhere else, drop --source and use the published images:
+    ./install.sh --dir $INSTALL_DIR"
+  fi
+  if   looks_like_checkout "$script_parent"; then ROOT=$script_parent
+  elif looks_like_checkout "$PWD";           then ROOT=$PWD
+  else die "--source needs a complete checkout beside this script: docker-compose.yml,
+  backend/Dockerfile and supabase/migrations. Run it from one, or drop --source
+  and install from the published images instead."
+  fi
+else
+  # ⚠ WHERE THIS LANDS DECIDES WHICH DATABASE IT OPENS.
+  #
+  # Anyone who installed from the older instructions has docker-compose.yml and
+  # .env sitting directly in a folder. If a re-run created ./cadre-growth
+  # underneath that instead, the project-name walk further down would find
+  # 'cadregrowth' owned by a DIFFERENT working_dir, step past it to
+  # 'cadregrowth-2', and stand up a second, empty database beside the real one.
+  # The install would look new and work perfectly, while the customer's data sat
+  # in a stack that nothing points at any more.
+  #
+  # So an install already in this directory is always continued in place.
+  if   [ -n "$INSTALL_DIR" ]; then ROOT=$INSTALL_DIR
+  elif [ -f "$PWD/.env" ] || [ -f "$PWD/docker-compose.yml" ]; then ROOT=$PWD
+  else ROOT="$PWD/cadre-growth"
+  fi
+  mkdir -p "$ROOT" || die "cannot create $ROOT"
+  # shellcheck disable=SC1007
+  ROOT=$(CDPATH= cd -- "$ROOT" && pwd)
+  # A checkout's compose file builds from source. Overwriting it with the
+  # published-images one would quietly retarget somebody's whole install.
+  if [ -f "$ROOT/docker-compose.yml" ] && grep -qE '^[[:space:]]+build:' "$ROOT/docker-compose.yml"; then
+    die "$ROOT builds from source, and installing images over it would replace its
+  docker-compose.yml. Run ./scripts/install.sh from there instead, or choose
+  somewhere else with --dir <path>."
+  fi
+fi
+cd "$ROOT"
+
+# How to spell this script in messages, which differs between the two layouts.
+if [ "$MODE" = source ]; then SELF='./scripts/install.sh'; else SELF='./install.sh'; fi
+
+REPO=${CADREGROWTH_REPO:-AI-Innovation-India/CadreGrowth_OS}
+RAW_BASE="https://raw.githubusercontent.com/$REPO"
+STAMP="$ROOT/.cadregrowth-install"
+
+# ── where questions get answered, decided once ───────────────────────────────
+#
+# Under `bash -c "$(curl …)"` stdin is still the terminal. Under `curl | bash`
+# stdin IS the script, so a `read` there consumes the script itself — fall back
+# to the controlling terminal, and when there is none, say so rather than
+# silently answering every question with its default.
+# The braces matter: `exec 3</dev/tty 2>/dev/null` applies its redirections left
+# to right, so the /dev/tty open fails and prints before 2>/dev/null exists. In a
+# cron job or a container that lands as a bare "No such device or address" above
+# the first real output. Redirecting the GROUP puts the muffle in place first.
+if   [ -t 0 ]; then exec 3<&0; INTERACTIVE=1
+elif { exec 3</dev/tty; } 2>/dev/null; then INTERACTIVE=1
+else INTERACTIVE=0
+fi
+
+ask() { # ask <prompt> <default> <flag-that-supplies-it> -> echoes the answer
+  local prompt="$1" default="$2" flag="$3" reply
+  if [ "$ASSUME_YES" = 1 ]; then echo "$default"; return; fi
+  if [ "$INTERACTIVE" = 0 ]; then
+    die "nothing here can answer \"$prompt\", and this run has no terminal.
+
+  The address is stored in the database as the one every public link is built
+  from, so a wrong answer here surfaces much later as links that 404 — and as
+  browser requests refused by CORS, which arrive at the login screen as
+  \"Incorrect email or password\".
+
+  Either supply it:      $SELF $flag <value>
+  or take the default:   $SELF --yes   ${DIM}(currently: $default)${N}"
+  fi
+  printf '  %s [%s]: ' "$prompt" "$default" >&2
+  read -r reply <&3 || reply=''
+  echo "${reply:-$default}"
+}
+
+# ── 1. prerequisites ─────────────────────────────────────────────────────────
+step 'Checking prerequisites'
+
+command -v docker >/dev/null 2>&1 || die \
+  "docker is not installed. See https://docs.docker.com/engine/install/"
+
+docker compose version >/dev/null 2>&1 || die \
+  "the Docker Compose v2 plugin is missing ('docker compose', not 'docker-compose').
+  Install it with your Docker packages, then re-run this script."
+
+docker info >/dev/null 2>&1 || die \
+  "cannot talk to the Docker daemon. Start it (or add your user to the 'docker'
+  group and log back in), then re-run this script."
+
+command -v openssl >/dev/null 2>&1 || die "openssl is required to generate secrets."
+
+# Only the images path downloads anything, and it downloads before it can report
+# anything useful — so check for the tool here rather than failing mid-fetch.
+DL=''
+if [ "$MODE" = images ]; then
+  if   command -v curl >/dev/null 2>&1; then DL=curl
+  elif command -v wget >/dev/null 2>&1; then DL=wget
+  else die "curl or wget is required to download the compose file and helper scripts."
+  fi
+fi
+ok "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'), compose plugin, openssl${DL:+, $DL}"
+
+# Building the frontend needs real memory; a 1 GB VPS OOMs mid-build with an
+# error that looks like a code fault rather than a resource limit. Nothing is
+# built on the images path, so the check would only be a scary irrelevance there.
+if [ "$MODE" = source ]; then
+  mem_mb=''
+  if [ -r /proc/meminfo ]; then                                   # Linux
+    mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+  elif command -v sysctl >/dev/null 2>&1; then                    # macOS / BSD
+    bytes=$(sysctl -n hw.memsize 2>/dev/null || echo '')
+    case "$bytes" in ''|*[!0-9]*) : ;; *) mem_mb=$((bytes / 1048576)) ;; esac
+  fi
+  if [ -n "$mem_mb" ]; then
+    if [ "$mem_mb" -lt 1800 ]; then
+      warn "only ${mem_mb} MB RAM detected — the frontend build may be OOM-killed."
+      warn "If it dies without a clear error, add swap or build elsewhere and push the image."
+    else
+      ok "${mem_mb} MB RAM"
+    fi
+  fi
+fi
+
+# Pulling finished images needs less room than building them does.
+if [ "$MODE" = source ]; then disk_need=3000; disk_why='images need roughly 2-3 GB to build'
+else                          disk_need=1500; disk_why='the images need roughly 1.5 GB'
+fi
+avail_mb=$(df -Pm . 2>/dev/null | awk 'NR==2 {print $4}')
+case "$avail_mb" in
+  ''|*[!0-9]*) : ;;   # df said something unexpected; not worth guessing about
+  *)
+    if [ "$avail_mb" -lt "$disk_need" ]; then
+      warn "only ${avail_mb} MB free disk — $disk_why."
+    else
+      ok "${avail_mb} MB free disk"
+    fi
+    ;;
+esac
+
+# ── 1.5 download (images mode only) ──────────────────────────────────────────
+#
+# This is where the product arrives when there is no checkout. Everything
+# fetched here is REPLACED on every run — that overwrite is precisely what makes
+# re-running this script the upgrade. `.env` is the one thing never touched.
+IMAGE_TAG=''; PINNED_REF=''
+if [ "$MODE" = images ]; then
+  # Which revision the files come from. A pinned install has to STAY pinned:
+  # without this, a customer re-running the script only to change their domain
+  # would be silently moved onto whatever is on main that day.
+  FETCH_REF=$PIN_REF
+  PINNED_REF=$PIN_REF
+  if [ -f "$STAMP" ]; then
+    # Two different facts, and collapsing them was a bug. `ref` is where the
+    # FILES came from; it sticks so a bare re-run cannot jump an install off the
+    # branch or tag it was put on. `version` records an explicit --version, and
+    # ONLY that may dictate the image tag — a branch is a fine source of files
+    # and publishes no image of its own, so treating every remembered ref as a
+    # pin sent `docker compose pull` after a tag that was never built.
+    [ -n "$FETCH_REF" ]  || FETCH_REF=$(sed -n 's/^ref=//p' "$STAMP" | head -1)
+    [ -n "$PINNED_REF" ] || PINNED_REF=$(sed -n 's/^version=//p' "$STAMP" | head -1)
+  fi
+  # ⚠ CADREGROWTH_REF deliberately does NOT feed PINNED_REF, and therefore does
+  # not become the image tag. Git refs and image tags are different namespaces:
+  # releases exist in both, but a BRANCH publishes no image of its own, so
+  # pulling `:my-branch` would 404 on a branch that is otherwise fine. Moving the
+  # files alone is exactly what testing an unreleased branch needs.
+  FETCH_REF=${FETCH_REF:-${CADREGROWTH_REF:-main}}
+
+  # ⚠ The same two namespaces as the image-tag strip further down, in the other
+  #   direction. Git tags here are `v1.0.0`; the IMAGE tag is `1.0.0` — and
+  #   `1.0.0` is the form .env records, `docker ps` prints and the release notes
+  #   quote, so it is the form somebody copies back into `--version`. As a git
+  #   ref it does not exist: raw.githubusercontent answers 404, and the failure
+  #   reads "the version '1.0.0' does not exist" — which blames the release for
+  #   a missing single character.
+  #
+  #   No branch in this repo begins with a digit, so a leading digit means a
+  #   release, and the ref for a release carries the `v`. PINNED_REF is left
+  #   exactly as given: as an image tag, `1.0.0` is already right.
+  case "$FETCH_REF" in
+    [0-9]*) FETCH_REF=v$FETCH_REF ;;
+  esac
+
+  fetch() { # fetch <path-in-repo> <destination> [optional]
+    # `optional` marks a file the install does not need in order to work — a
+    # helper script rather than a compose file. Those must not be fatal, because
+    # a bundle built before the helper existed does not contain it, and refusing
+    # to install for the want of a convenience is the wrong trade.
+    local url="$RAW_BASE/$FETCH_REF/$1" tmp="$2.part.$$" rc=0 optional="${3:-}"
+    mkdir -p "$(dirname "$2")"
+    case "$DL" in
+      curl) curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp" "$url" || rc=$? ;;
+      wget) wget -q -T 15 -t 3 -O "$tmp" "$url" || rc=$? ;;
+    esac
+    if [ "$rc" != 0 ] || [ ! -s "$tmp" ]; then
+      rm -f "$tmp"
+      # ⚠ A failed download is only fatal when there is nothing to fall back to.
+      #   The release bundle ships these same files, and this script re-downloads
+      #   them unconditionally because that is how an upgrade works — so a bundle
+      #   user with no network, or anyone caught by GitHub rate-limiting raw
+      #   (HTTP 429, which happens and is nobody's fault), was stopped dead while
+      #   a perfectly good copy sat in the directory. Keep it and say so.
+      #
+      #   Not silent: the existing file may be older than the images about to be
+      #   pulled, and that is exactly the mismatch worth naming out loud.
+      if [ -s "$2" ]; then
+        FETCH_FELL_BACK=1
+        warn "could not download $1 — keeping the copy already here"
+        return 0
+      fi
+      if [ -n "$optional" ]; then
+        FETCH_FELL_BACK=1
+        warn "could not download $1 — carrying on without it"
+        return 0
+      fi
+      die "could not download $1
+  from $url
+
+  If this is HTTP 429, GitHub is rate-limiting anonymous downloads. It clears on
+  its own, usually within the hour. The release bundle is served from a different
+  host and is not affected:
+
+    https://github.com/AI-Innovation-India/CadreGrowth_OS/releases/latest
+
+  Download it, unzip it, open the folder for your operating system and run
+  ./install.sh from inside it — these files will already be there.
+
+  Otherwise this machine cannot reach GitHub, or the version '$FETCH_REF' does
+  not exist. Check the version, or pass a different one with --version."
+    fi
+    # mv rather than downloading straight onto $2: this replaces the inode, so a
+    # file bash is still reading — install.sh replacing itself during an upgrade
+    # — is never truncated underneath the running shell.
+    mv "$tmp" "$2"
+  }
+
+  step "Downloading Cadre Growth OS ($FETCH_REF)"
+  fetch docker-compose.images.yml docker-compose.yml
+  # A redirect or an error page that still arrived with a 200 would otherwise be
+  # discovered by compose, several baffling errors later.
+  grep -q '^name: cadregrowth' docker-compose.yml \
+    || die "what downloaded is not Cadre Growth OS's compose file — refusing to use it."
+  # caddy/Caddyfile is bind-mounted by the tls profile. If it were missing Docker
+  # would create a DIRECTORY at that path and Caddy would fail with "is a
+  # directory", so it is fetched every time whether or not HTTPS is on today.
+  fetch caddy/Caddyfile    caddy/Caddyfile
+  fetch scripts/up.sh      up.sh
+  fetch scripts/down.sh    down.sh
+  fetch scripts/install.sh install.sh
+  fetch scripts/admin-password.sh admin-password.sh optional
+  chmod +x up.sh down.sh install.sh
+  [ -f admin-password.sh ] && chmod +x admin-password.sh
+  # Seeded, never overwritten. .env is created FROM this by the next step, and
+  # the FRESH_ENV logic that protects an existing database depends on knowing
+  # which of those two things happened.
+  [ -f "$ROOT/.env" ] || fetch .env.example .env.example
+  if [ "$FETCH_FELL_BACK" = 1 ]; then
+    warn 'some files could not be downloaded and the local copies were used.'
+    warn '  They may be older than the images this is about to pull. Re-run when'
+    warn '  the network recovers to bring them up to date.'
+  else
+    ok 'compose file, Caddyfile, up.sh, down.sh, install.sh'
+  fi
+
+  {
+    echo '# .cadregrowth-install — written by install.sh, safe to delete'
+    echo 'mode=images'
+    echo "ref=$FETCH_REF"
+    echo "version=$PINNED_REF"
+    echo "installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$STAMP"
+fi
+
+# ── 2. configuration ─────────────────────────────────────────────────────────
+step 'Configuring'
+
+ENV_FILE="$ROOT/.env"
+# Whether this run is starting from scratch. It decides whether a database that
+# already exists on this machine may be adopted: an .env we just generated has
+# secrets that no existing database can match (see "which install is this?").
+FRESH_ENV=0
+if [ ! -f "$ENV_FILE" ]; then
+  [ -f "$ROOT/.env.example" ] || die ".env.example is missing from $ROOT.
+  On the images path it is downloaded; on a source path it comes with the
+  checkout. If this IS a checkout, pass --source to say so."
+  cp "$ROOT/.env.example" "$ENV_FILE"
+  FRESH_ENV=1
+  ok "created .env from .env.example"
+else
+  ok "using the existing .env (values already set are left alone)"
+fi
+
+# get_env <key> -> current value ('' if unset/commented)
+get_env() { sed -n "s/^${1}=//p" "$ENV_FILE" | head -1; }
+
+# set_env <key> <value> — replaces the line in place, or appends if absent.
+# In-place rather than appending duplicates: two definitions of one key is
+# legal for compose (last wins) but is the kind of file nobody can debug later.
+set_env() {
+  local key="$1" val="$2" tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/cadregrowth.XXXXXX")
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    # value goes through the environment, so any character is safe in it
+    KEY="$key" VAL="$val" awk '
+      index($0, ENVIRON["KEY"] "=") == 1 && !done { print ENVIRON["KEY"] "=" ENVIRON["VAL"]; done=1; next }
+      { print }
+    ' "$ENV_FILE" > "$tmp"
+  else
+    cp "$ENV_FILE" "$tmp"
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  fi
+  mv "$tmp" "$ENV_FILE"
+}
+
+# A value counts as "needs filling" when it is empty or still a placeholder.
+needs_value() {
+  local v; v=$(get_env "$1")
+  case "$v" in
+    ''|change-me|change-me-too|changeme|your-*|CHANGE_ME) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── which install is this? ───────────────────────────────────────────────────
+#
+# ⚠ THE COMPOSE PROJECT NAME IS THE ONLY THING SEPARATING TWO INSTALLS ON ONE
+# MACHINE. It prefixes the containers *and* the volumes, so two checkouts that
+# share a name share a database — and the second install.sh then points freshly
+# generated secrets at the first one's data.
+#
+# That failure is silent at install time and ugly later. Postgres reads
+# POSTGRES_PASSWORD only when it first creates its data directory, so the new
+# password is ignored and the backend loops on an authentication error naming
+# the database rather than the real cause. CADRECRM_ENCRYPTION_KEY is worse: it
+# would decrypt nothing that the first install stored.
+#
+# docker-compose.yml pins `name: cadregrowth`, which is right for the ordinary
+# one-install-per-machine case. COMPOSE_PROJECT_NAME in .env overrides it, so a
+# second install claims its own name and the published compose file needs no
+# change at all.
+#
+# Who already holds a project name: 'me' (containers created from THIS
+# directory), 'other' (another directory's), 'orphan' (no containers, but a
+# database volume outlived them — `docker compose down` keeps volumes), or
+# empty when the name is free.
+project_owner() {
+  local name="$1" dirs
+  dirs=$(docker ps -a --filter "label=com.docker.compose.project=$name" \
+           --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u)
+  if [ -n "$dirs" ]; then
+    if [ "$dirs" = "$ROOT" ]; then echo me; else echo other; fi
+    return
+  fi
+  if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -qx "${name}_pgdata"; then
+    echo orphan; return
+  fi
+  echo ''
+}
+
+# An explicit COMPOSE_PROJECT_NAME in the environment wins, so the suggestion
+# printed by the guard below actually works; .env is where it then lives.
+PROJECT=${COMPOSE_PROJECT_NAME:-}
+[ -n "$PROJECT" ] || PROJECT=$(get_env COMPOSE_PROJECT_NAME)
+if [ -n "$PROJECT" ]; then
+  set_env COMPOSE_PROJECT_NAME "$PROJECT"
+  ok "install name '$PROJECT'  ${DIM}(named already — upgrading this install in place)${N}"
+else
+  # No name recorded yet: either the first install ever, or one made before
+  # install.sh started recording it. Walk up until a name is free or provably
+  # ours, and never adopt data we cannot show belongs to this directory.
+  candidate=cadregrowth; n=1; stepped=''; mine=0
+  while : ; do
+    case "$(project_owner "$candidate")" in
+      '') break ;;
+      # Containers created from THIS directory: not a collision at all, this is
+      # the install we belong to. Anything we stepped over on the way is
+      # somebody else's business and not worth reporting.
+      me) mine=1; stepped=''; break ;;
+      orphan)
+        # An .env that survived a `docker compose down` is this directory's own
+        # record of that stack, secrets included — so the data really is ours.
+        # A brand-new .env cannot make that claim about anybody's data.
+        [ "$FRESH_ENV" = 0 ] && { mine=1; stepped=''; break; }
+        stepped="a stopped install named '$candidate' still holds a database here"
+        ;;
+      other) stepped="'$candidate' belongs to another install on this machine" ;;
+    esac
+    n=$((n + 1)); candidate="cadregrowth-$n"
+  done
+  PROJECT="$candidate"
+  set_env COMPOSE_PROJECT_NAME "$PROJECT"
+  if [ "$mine" = 1 ]; then
+    ok "install name '$PROJECT'  ${DIM}(this directory's existing install)${N}"
+  elif [ -n "$stepped" ]; then
+    warn "$stepped"
+    ok "install name '$PROJECT'  ${DIM}(a separate install — its own containers, database and volumes)${N}"
+    warn "to upgrade that other install instead, run this script from ITS directory."
+  else
+    ok "install name '$PROJECT'"
+  fi
+fi
+# Exported so every `docker compose` below resolves the same project even if the
+# shell is invoked from elsewhere; .env carries it for every later manual run.
+export COMPOSE_PROJECT_NAME="$PROJECT"
+
+# Belt and braces for the one case the walk above cannot route around: this
+# directory's containers exist (owner 'me') but its .env has been lost, so the
+# secrets are new and the database they must open is not.
+if [ "$FRESH_ENV" = 1 ] && docker volume ls --format '{{.Name}}' 2>/dev/null | grep -qx "${PROJECT}_pgdata"; then
+  # Suggest a name that is actually free — pointing at a taken one would send
+  # the reader straight back into this same error.
+  free=cadregrowth; fn=1
+  while [ -n "$(project_owner "$free")" ]; do fn=$((fn + 1)); free="cadregrowth-$fn"; done
+  # .env came from .env.example moments ago and has no data behind it; leaving
+  # it would make the NEXT run look like an upgrade of a database it cannot open.
+  rm -f "$ENV_FILE"
+  die "install '$PROJECT' already has a database, but this .env was just generated,
+  so its POSTGRES_PASSWORD and CADRECRM_ENCRYPTION_KEY do not match it. Postgres
+  only applies POSTGRES_PASSWORD when it first creates its data, and the
+  encryption key decrypts credentials stored under the old one.
+
+  Nothing was changed, and the generated .env has been removed.
+
+  Either restore that install's original .env here and re-run,
+  or start a separate install:   COMPOSE_PROJECT_NAME=$free $SELF
+  or discard the old data:       docker volume rm ${PROJECT}_pgdata   (deletes it permanently)"
+fi
+
+# Refuse a port already in use rather than letting `compose up` fail later with
+# a bind error buried in the output. Each tool here exists on a different
+# platform (ss = Linux, lsof = macOS, netstat = both + Git Bash); if none is
+# present we simply skip the check rather than guessing.
+port_in_use() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -qE "[:.]${1}[[:space:]]"
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${1}" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -an 2>/dev/null | grep -qE "[:.]${1}[[:space:]].*LISTEN"
+  else
+    return 1
+  fi
+}
+# ...but the port being busy is EXPECTED when re-running against a stack that is
+# already up — that container is the one holding it. Only object when the
+# listener is somebody else's. Resolved through COMPOSE_PROJECT_NAME above, so
+# it asks about THIS install and not a namesake.
+ours_running=0
+if docker compose ps --status running --services 2>/dev/null | grep -qx web; then
+  ours_running=1
+fi
+
+is_ipv4() {
+  case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+  local octet rest="$1" count=0
+  while [ -n "$rest" ]; do
+    octet=${rest%%.*}
+    case "$rest" in *.*) rest=${rest#*.} ;; *) rest='' ;; esac
+    [ -n "$octet" ] || return 1
+    [ "$octet" -le 255 ] 2>/dev/null || return 1
+    count=$((count + 1))
+  done
+  [ "$count" = 4 ]
+}
+
+# Addresses that exist on the machine but are NOT how anyone reaches it: RFC1918
+# behind NAT, loopback, link-local, and 100.64/10 — the carrier-grade range that
+# Tailscale also uses, so a box on a tailnet has one of these sitting right next
+# to its real address.
+is_private_ipv4() {
+  case "$1" in
+    10.*|127.*|169.254.*|192.168.*|0.*|255.*)  return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*)     return 0 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+  esac
+  return 1
+}
+
+# The address this machine is actually reachable at, asked of the kernel rather
+# than of a stranger: "which source address would you use to reach the internet?"
+#
+# Deliberately NOT `curl ifconfig.me`. That needs the network, trusts a third
+# party, and on a dual-stack host answers with the IPv6 address — verified: this
+# project's own server returns 2a02:4780:12:a474::1, which builds a URL that
+# works for nobody. `hostname -I` is no better: on that same box it lists nine
+# addresses, seven of them docker bridges.
+#
+# Silent unless the answer is a PUBLIC IPv4. Behind NAT the machine's own address
+# is not the address people type, and offering 10.x as "the address people will
+# use" is a confident wrong answer — worse than the localhost it replaces,
+# because localhost at least looks obviously unfinished.
+detect_public_ipv4() {
+  local ip='' iface=''
+  if command -v ip >/dev/null 2>&1; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+         | sed -n 's/.*[[:space:]]src[[:space:]]*\([0-9.]*\).*/\1/p' | head -1)
+  fi
+  if [ -z "$ip" ] && command -v route >/dev/null 2>&1; then
+    # macOS has no `ip`: ask for the default route's interface, then its address.
+    iface=$(route -n get default 2>/dev/null \
+            | sed -n 's/.*interface:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
+    if [ -n "$iface" ] && command -v ipconfig >/dev/null 2>&1; then
+      ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+    fi
+  fi
+  is_ipv4 "$ip" || return 1
+  is_private_ipv4 "$ip" && return 1
+  printf '%s' "$ip"
+}
+
+# ── the one question ─────────────────────────────────────────────────────────
+#
+# Everything about the public address comes from a single answer: the CORS
+# origin, the host used to build public links, whether HTTPS is switched on, and
+# whether the plain-HTTP port is exposed at all. Asking for those separately —
+# port, then public URL, then domain — was asking one question four times in
+# four different vocabularies, and every one of them could disagree with the
+# others.
+if   [ -n "$DOMAIN" ];     then ADDRESS=$DOMAIN
+elif [ -n "$PUBLIC_URL" ]; then ADDRESS=$PUBLIC_URL
+else
+  # An install that already has an address KEEPS it, without asking. Re-running
+  # this script is how you upgrade, and an upgrade must not need somebody at a
+  # keyboard — nor quietly move the site. --domain and --url are how it moves.
+  #
+  # Reconstructed so the shape comes out the same as last time, which CORS_ORIGIN
+  # alone cannot tell you: https://crm.example.com is a caddy install when
+  # TLS_DOMAIN names it and somebody else's proxy when it does not, and those two
+  # differ in whether this stack should start caddy at all.
+  keep_tls=$(get_env TLS_DOMAIN)
+  keep_origin=$(get_env CORS_ORIGIN)
+  reuse=''
+  if [ "$FRESH_ENV" = 0 ]; then
+    if [ -n "$keep_tls" ]; then reuse=tls
+    else
+      case "$keep_origin" in
+        https://*) reuse=proxy ;;
+        http://*)  reuse=plain ;;
+      esac
+    fi
+  fi
+  case "$reuse" in
+    tls)   DOMAIN=$keep_tls; ADDRESS=$keep_tls
+           ok "address https://$keep_tls  ${DIM}(unchanged)${N}" ;;
+    proxy) PUBLIC_URL=$keep_origin; URL_GIVEN=1; ADDRESS=$keep_origin
+           ok "address $keep_origin  ${DIM}(unchanged)${N}" ;;
+    plain)
+      # A plain-HTTP origin on a real hostname can only have come from --url —
+      # nothing here terminates TLS for it — so it has to come back as `proxy`,
+      # or the dots in that name would read as a domain and start caddy for it.
+      case "${keep_origin#http://}" in
+        localhost*|127.0.0.1*) ADDRESS=${keep_origin#*://} ;;
+        *) PUBLIC_URL=$keep_origin; URL_GIVEN=1; ADDRESS=$keep_origin ;;
+      esac
+      ok "address $keep_origin  ${DIM}(unchanged)${N}" ;;
+    *)
+      # A server that has a public address should not have to be told its own
+      # address. Offered as the DEFAULT rather than chosen silently: it is still
+      # visible, still one keypress to accept, and still overridable by typing a
+      # domain — but nobody ends up with a localhost install on a machine whose
+      # entire purpose is being reachable.
+      #
+      # This is also what --yes now means on such a machine. It used to mean
+      # localhost, which the die() text three functions up already argues against:
+      # "an install on http://localhost — reachable by nobody — with that address
+      # stored in its database as the one to build public links from". Guessing
+      # localhost was still a guess; it was just a guess that always lost.
+      DETECTED=$(detect_public_ipv4 || true)
+      if [ -n "$DETECTED" ]; then
+        ADDRESS=$(ask 'Domain people will use to reach this' "$DETECTED" --domain)
+        if [ "$ADDRESS" = "$DETECTED" ]; then
+          ok "address $DETECTED  ${DIM}(this machine's own public address)${N}"
+        fi
+      else
+        ADDRESS=$(ask 'Domain people will use to reach this (blank for localhost)' \
+                      localhost --domain)
+      fi ;;
+  esac
+fi
+
+# Normalise first: a scheme, a trailing path and a trailing dot all describe the
+# same address, and only one of those spellings should reach the logic below.
+ADDRESS=${ADDRESS#*://}; ADDRESS=${ADDRESS%%/*}; ADDRESS=${ADDRESS%.}
+ADDR_PORT=''
+case "$ADDRESS" in *:[0-9]*) ADDR_PORT=${ADDRESS##*:}; ADDRESS=${ADDRESS%:*} ;; esac
+ADDRESS=$(printf '%s' "$ADDRESS" | tr '[:upper:]' '[:lower:]')
+
+# ⚠ The order of these tests matters. 203.0.113.4 has dots in it and is NOT a
+# domain — checking for a dot first would send the installer off to obtain a
+# certificate for an IP address, which Let's Encrypt will never issue, and the
+# failure would surface two minutes later inside Caddy's log.
+if [ -z "$ADDRESS" ] || [ "$ADDRESS" = localhost ] || [ "$ADDRESS" = 127.0.0.1 ]; then
+  SHAPE=local; ADDRESS=localhost
+elif is_ipv4 "$ADDRESS"; then
+  SHAPE=ip
+else
+  case "$ADDRESS" in
+    *' '*) die "'$ADDRESS' is not a hostname. Use something like crm.example.com." ;;
+    *.*)   SHAPE=domain ;;
+    *)     die "'$ADDRESS' has no dot in it, so no certificate could ever be issued
+  for it. Use a full hostname like crm.example.com, an IP address, or leave it
+  blank for an install only this machine can reach." ;;
+  esac
+fi
+# --url means "my own proxy terminates TLS": take the origin as given and leave
+# the bundled caddy alone, however domain-shaped the address looks.
+if [ "$URL_GIVEN" = 1 ] && [ -z "$DOMAIN" ]; then SHAPE=proxy; fi
+
+# ── the host port ────────────────────────────────────────────────────────────
+#
+# Resolved after the address, not before, because the address can contain one:
+# answering "localhost:9000" has to end up serving on 9000, or the URL printed
+# at the end is not the URL the stack is listening on. --port still wins over
+# both, and a domain install ignores the question entirely — there the port is
+# bound to loopback and only caddy talks to it.
+#
+# No longer asked. "Host port for the web UI" is not a question the person this
+# installer exists for can answer.
+if [ -z "$WEB_PORT" ]; then
+  if [ -n "$ADDR_PORT" ] && [ "$SHAPE" != domain ]; then
+    WEB_PORT=$ADDR_PORT
+  else
+    WEB_PORT=$(get_env WEB_PORT); WEB_PORT=${WEB_PORT:-8080}
+    # A second install on one machine always collides on 8080, and "port in use,
+    # re-run with --port" is a dead end the script can simply walk past. Only the
+    # automatic choice moves: --port is still obeyed exactly, and a port given by
+    # hand still fails below rather than being changed underneath you.
+    if [ "$ours_running" = 0 ] && port_in_use "$WEB_PORT"; then
+      busy=$WEB_PORT
+      while port_in_use "$WEB_PORT"; do WEB_PORT=$((WEB_PORT + 1)); done
+      warn "port $busy is in use — using $WEB_PORT instead"
+    fi
+  fi
+fi
+case "$WEB_PORT" in ''|*[!0-9]*) die "--port must be a number (got '$WEB_PORT')" ;; esac
+
+if [ "$ours_running" = 0 ] && port_in_use "$WEB_PORT"; then
+  die "port $WEB_PORT is already in use by another process. Re-run with --port <other>."
+fi
+
+# ── first-run admin ──────────────────────────────────────────────────────────
+#
+# Not a question either. On a domain install admin@<that domain> is an address
+# the operator controls, which matters because it is also what goes to Let's
+# Encrypt as the certificate contact — the old default sent admin@example.com, a
+# reserved domain nobody can receive mail at. Changed in the UI afterwards.
+[ -n "$ADMIN_EMAIL" ] || ADMIN_EMAIL=$(get_env BOOTSTRAP_ADMIN_EMAIL)
+if [ -z "$ADMIN_EMAIL" ] || [ "$ADMIN_EMAIL" = 'admin@example.com' ]; then
+  ADMIN_EMAIL='admin@example.com'
+  # Only a real hostname earns this. "localhost" and an IP address are not mail
+  # domains, and admin@203.0.113.4 handed to Let's Encrypt is worse than the
+  # placeholder it replaced.
+  case "$SHAPE" in
+    domain|proxy)
+      if ! is_ipv4 "$ADDRESS"; then
+        case "$ADDRESS" in *.*) ADMIN_EMAIL="admin@$ADDRESS" ;; esac
+      fi ;;
+  esac
+fi
+
+# ── HTTPS ────────────────────────────────────────────────────────────────────
+#
+# A domain is the whole public-address story: it turns on the bundled caddy
+# (compose profile `tls`), which obtains and renews a Let's Encrypt certificate
+# knowing nothing but the domain. No resolver to configure, no acme.json, and
+# nothing in this repo that names one particular server — which is what made
+# the previous arrangement, a hand-written proxy file living outside the repo,
+# impossible to reproduce anywhere else.
+#
+# COMPOSE_PROFILES goes into .env rather than being passed here, so every later
+# plain `docker compose up -d` from this directory still brings HTTPS up.
+DOMAIN=''
+if [ "$SHAPE" = domain ]; then
+  DOMAIN=$ADDRESS
+  [ -z "$ADDR_PORT" ] || warn "HTTPS is served on 443 — ignoring the :$ADDR_PORT."
+
+  # 80 is not optional: the certificate challenge arrives on it. Failing here
+  # beats failing inside Caddy, where the reason is a stack trace about binding.
+  tls_running=0
+  if docker compose ps --status running --services 2>/dev/null | grep -qx caddy; then tls_running=1; fi
+  if [ "$tls_running" = 0 ]; then
+    for p in 80 443; do
+      if port_in_use "$p"; then
+        die "port $p is in use, and HTTPS needs both 80 and 443.
+  Something else — another web server, or a reverse proxy — is already there.
+  Either stop it, or give the address as --url https://$ADDRESS and point that
+  proxy at port $WEB_PORT instead."
+      fi
+    done
+  fi
+
+  [ -n "$TLS_EMAIL" ] || TLS_EMAIL=$(get_env TLS_EMAIL)
+  # Defaulting to the admin address keeps this to ONE required argument. Let's
+  # Encrypt only uses it to warn before a renewal failure expires the site.
+  [ -n "$TLS_EMAIL" ] || TLS_EMAIL=$ADMIN_EMAIL
+
+  set_env TLS_DOMAIN "$DOMAIN"
+  set_env TLS_EMAIL "$TLS_EMAIL"
+  set_env COMPOSE_PROFILES tls
+  # Admin Settings -> Domain can add more domains later and caddy will obtain
+  # their certificates on first visit, because this install owns 80 and 443.
+  set_env TLS_MODE caddy
+  # With caddy in front, the plain-HTTP port must not also be public, or the
+  # site is reachable twice and once of those has no certificate.
+  set_env WEB_BIND 127.0.0.1
+  export COMPOSE_PROFILES=tls
+
+  if [ "$TLS_EMAIL" = internal ]; then
+    ok "HTTPS on $DOMAIN  ${DIM}(self-signed — browsers will warn)${N}"
+  else
+    ok "HTTPS on $DOMAIN  ${DIM}(Let's Encrypt, renewed automatically)${N}"
+    # A certificate cannot be issued for a name that does not point here, and
+    # the failure otherwise appears minutes later in Caddy's log. A warning and
+    # not an error: split-horizon DNS and a proxied A record both look wrong
+    # from inside the machine yet work perfectly from outside.
+    #
+    # ⚠ The `|| true` inside each pipeline is load-bearing. `getent` exits 2 when
+    # a name does not resolve, and under `set -o pipefail` that status becomes
+    # the pipeline's — so `set -e` killed the install, silently, at exit 2, in
+    # precisely the case this check exists to report gently: a domain whose DNS
+    # has not propagated yet.
+    resolved=''
+    if command -v getent >/dev/null 2>&1; then
+      resolved=$( { getent ahostsv4 "$DOMAIN" 2>/dev/null || true; } | awk 'NR==1{print $1}')
+    elif command -v dig >/dev/null 2>&1; then
+      resolved=$( { dig +short A "$DOMAIN" 2>/dev/null || true; } | head -1)
+    fi
+    if [ -z "$resolved" ]; then
+      warn "$DOMAIN does not resolve yet — add its DNS record, or the certificate will not be issued."
+    else
+      ok "$DOMAIN resolves to $resolved"
+    fi
+  fi
+else
+  # Make sure a previous domain run does not leave HTTPS half-on: the profile
+  # would still start caddy, now for a domain this install no longer answers to.
+  #
+  # ⚠ Say nothing here. The branch below may switch caddy straight back on, and
+  #   announcing the clear at this point printed a flat contradiction two lines
+  #   apart:
+  #       ! HTTPS turned off — re-run with --domain <host> to bring it back.
+  #       ✓ HTTPS ready  (add a domain in Admin Settings → Domain whenever you like)
+  #   What is actually lost is the certificate for a specific host, not HTTPS —
+  #   so remember the host and report it once the state has settled.
+  DROPPED_TLS_DOMAIN=$(get_env TLS_DOMAIN)
+  if [ -n "$(get_env COMPOSE_PROFILES)" ]; then
+    set_env COMPOSE_PROFILES ''
+    set_env TLS_DOMAIN ''
+    set_env WEB_BIND '0.0.0.0'
+  fi
+
+  # ── can this install add domains for itself later? ───────────────────────
+  #
+  # Admin Settings -> Domain lets someone add a domain long after installing,
+  # and the bundled caddy obtains its certificate on the first visit. That only
+  # works if THIS install is the thing answering on 80 and 443, and on a shared
+  # server it will not be — another install, or a reverse proxy, already has
+  # them. There is no way to share a port, so the honest thing is to work out
+  # which situation this is now and let the app say so plainly, rather than
+  # offering a button that silently does nothing on half of all servers.
+  #
+  # `proxy` is not a lesser install. Adding a domain there still widens the
+  # allow-list immediately, which is half of what makes a domain work; only the
+  # certificate has to come from whatever already owns the ports.
+  if [ "$SHAPE" = proxy ]; then
+    # Told explicitly that something else terminates TLS. Believe it, and do not
+    # start a caddy that would fight the proxy for the ports.
+    set_env TLS_MODE proxy
+  elif port_in_use 80 || port_in_use 443; then
+    set_env TLS_MODE proxy
+    ok "another program owns ports 80/443  ${DIM}(domains added later need it pointed here)${N}"
+    ok "   ${DIM}how: docs/reverse-proxy.md — then Admin Settings → Domain → Check${N}"
+  else
+    # Free ports: run caddy now, with no domain of its own, purely so a domain
+    # added later needs nothing but DNS. It costs 64 MB and binds 80/443.
+    set_env COMPOSE_PROFILES tls
+    set_env TLS_MODE caddy
+    export COMPOSE_PROFILES=tls
+    ok "HTTPS ready  ${DIM}(add a domain in Admin Settings → Domain whenever you like)${N}"
+  fi
+
+  # ── optional: let this install publish its own routes ──────────────────────
+  #
+  # The app cannot configure a proxy it does not run, but this script can see
+  # what the app cannot: it has Docker. So the two values the in-app generator
+  # has to leave as placeholders — which container owns 80/443, and which network
+  # it is on — are detected here and written down once.
+  if [ -n "$PROXY_ROUTES" ]; then
+    if [ "$(get_env TLS_MODE)" = caddy ]; then
+      warn "--proxy-routes ignored: this install owns ports 80/443, so a domain added"
+      warn "  in Admin Settings → Domain already gets its certificate on the first visit."
+    else
+      # The proxy is whatever publishes 80 or 443. Identified by behaviour rather
+      # than by name, because it is Traefik here and something else elsewhere.
+      proxy_id=$(docker ps --format '{{.ID}} {{.Ports}}' 2>/dev/null \
+                 | grep -E '(^|[[:space:],])0\.0\.0\.0:(80|443)->' | head -1 | cut -d' ' -f1)
+      proxy_net=''
+      if [ -n "$proxy_id" ]; then
+        # Skip bridge/host: a container on those is not reachable by name, and a
+        # route pointing at an unreachable upstream is a 502 with no explanation.
+        proxy_net=$(docker inspect "$proxy_id" \
+                    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+                    | grep -vE '^(bridge|host|none|)$' | head -1)
+      fi
+
+      if [ -z "$proxy_net" ]; then
+        warn "could not work out which network your reverse proxy is on, so routes"
+        warn "  were not wired up. Set it by hand — docs/reverse-proxy.md."
+      else
+        mkdir -p "$PROXY_ROUTES" || die "cannot create $PROXY_ROUTES"
+        # shellcheck disable=SC1007
+        routes_abs=$(CDPATH= cd -- "$PROXY_ROUTES" && pwd)
+
+        # ⚠ The overlay lives BESIDE the routes directory, never inside it. That
+        #   directory is parsed by the proxy as route definitions, and a compose
+        #   file dropped in there is a parse error on every reload.
+        routing_overlay="$(dirname "$routes_abs")/cadregrowth-${PROJECT}-routing.yml"
+
+        cat > "$routing_overlay" <<YML
+# Wiring for automatic route publishing — written by install.sh.
+#
+# Mounts the directory your reverse proxy watches into this install's backend,
+# and puts the web container on the proxy's network so it can be reached.
+#
+# Kept outside the install directory: install.sh overwrites docker-compose.yml
+# on every upgrade, and this must survive that.
+services:
+  backend:
+    volumes:
+      - ${routes_abs}:/dynamic
+  web:
+    networks: [default, ${proxy_net}]
+
+networks:
+  ${proxy_net}:
+    external: true
+YML
+
+        set_env TRAEFIK_DYNAMIC_DIR /dynamic
+        set_env PROXY_ROUTES_DIR "$routes_abs"
+        # Compose names containers <project>-<service>-<n>. The CONTAINER name,
+        # not the service name: a service alias is not unique once two installs
+        # share a network, and `web` would resolve to whichever answered first.
+        set_env PROXY_UPSTREAM "http://${PROJECT}-web-1:80"
+
+        # Append without duplicating: an install may already carry an overlay.
+        existing_cf=$(get_env COMPOSE_FILE)
+        case ":$existing_cf:" in
+          *":$routing_overlay:"*) : ;;
+          *) if [ -n "$existing_cf" ]; then
+               set_env COMPOSE_FILE "$existing_cf:$routing_overlay"
+             else
+               set_env COMPOSE_FILE "docker-compose.yml:$routing_overlay"
+             fi ;;
+        esac
+        export COMPOSE_FILE
+        COMPOSE_FILE=$(get_env COMPOSE_FILE)
+
+        ok "routes published to $routes_abs  ${DIM}(proxy network: $proxy_net)${N}"
+        ok "   ${DIM}domains added in Admin Settings → Domain now need no shell${N}"
+        warn "your proxy must watch that directory. For Traefik, once:"
+        warn "  --providers.file.directory=/dynamic --providers.file.watch=true"
+        warn "  and mount $routes_abs at /dynamic inside it."
+      fi
+    fi
+  fi
+
+  # Reported last, and only when a named host really was dropped — this address
+  # no longer carries a certificate for it, whatever the lines above said about
+  # HTTPS in general. Naming the host makes the fix copy-pasteable.
+  if [ -n "$DROPPED_TLS_DOMAIN" ]; then
+    warn "no longer serving $DROPPED_TLS_DOMAIN — re-run with --domain $DROPPED_TLS_DOMAIN to bring that back."
+  fi
+fi
+
+# ── the derived address ──────────────────────────────────────────────────────
+case "$SHAPE" in
+  domain) PUBLIC_URL="https://$ADDRESS" ;;
+  proxy)  PUBLIC_URL=${PUBLIC_URL%/}
+    # ⚠ `--url http://host` with no port, on a site served from a port that is
+    #   not 80. The browser will send Origin: http://host:8080; CORS_ORIGIN says
+    #   http://host; they do not match, the request is refused, and the refusal
+    #   arrives as a bare 500 that the login screen renders as "Incorrect email
+    #   or password". Hours get spent on a password that was right all along.
+    #
+    #   It cannot simply be corrected, because the same spelling is also right:
+    #   a reverse proxy listening on port 80 and forwarding here means people
+    #   really do type http://host with no port. Guessing either way breaks the
+    #   other, so BOTH are accepted — CORS_ORIGIN takes a comma-separated list —
+    #   and the ambiguity is named out loud instead of resolved by coin flip.
+    #
+    #   CADRECRM_DOMAIN keeps what was typed: that is the address the operator
+    #   said people would use, and it is what public links get built from.
+    case "$PUBLIC_URL" in
+      http://*)
+        url_host=${PUBLIC_URL#http://}
+        case "$url_host" in
+          *:[0-9]*) : ;;                       # a port was given — nothing to do
+          *)
+            if [ "$WEB_PORT" != 80 ]; then
+              # Kept OUT of PUBLIC_URL on purpose: that variable is also the URL
+              # this script fetches to prove the site answers, the source of
+              # CADRECRM_DOMAIN, and what the summary prints. A comma-separated
+              # list belongs in CORS_ORIGIN and nowhere else.
+              CORS_EXTRA="http://$url_host:$WEB_PORT"
+              warn "http://$url_host has no port, but this serves on $WEB_PORT."
+              warn "  Accepting both origins. If people reach it at $CORS_EXTRA,"
+              warn "  re-run with --url $CORS_EXTRA so public links are built with it."
+            fi ;;
+        esac ;;
+    esac ;;
+  # WEB_PORT already absorbed any port in the address, so there is one source
+  # of truth for it rather than two that can disagree.
+  *)      PUBLIC_URL="http://$ADDRESS:$WEB_PORT" ;;
+esac
+
+if [ "$SHAPE" = ip ]; then
+  set_env WEB_BIND '0.0.0.0'
+  # Worth saying plainly, because the install otherwise looks completely fine
+  # and only fails later, in Meta's console, for a reason given nowhere here.
+  warn "no certificate is possible for an IP address, so this is plain HTTP."
+  warn "Meta will not accept a webhook URL that is not https://, and public lead-form"
+  warn "links are built as https:// too — re-run with --domain <host> before"
+  warn "connecting a WhatsApp number."
+elif [ "$SHAPE" = proxy ]; then
+  case "$PUBLIC_URL" in
+    https://*)
+      ok "public origin $PUBLIC_URL  ${DIM}(HTTPS terminated by your proxy)${N}"
+      # ⚠ This binding is the fix for a bug that reads as anything but a binding.
+      #
+      # Left on 0.0.0.0, the same site also answers on http://<host>:$WEB_PORT,
+      # and sooner or later somebody signs in THERE — it works, after all. But
+      # the login cookie is marked Secure, because the configured origin is
+      # https, and a browser silently discards a Secure cookie delivered over
+      # plain HTTP. Login returns 200 and the app renders from the response
+      # body; the next request carries no cookie and gets a 401. It presents as
+      # "logged out on every refresh" and "unauthorized when I change page",
+      # with nothing in any log, on an install where every check passed.
+      #
+      # So the second address simply stops existing. A proxy on this machine
+      # still reaches it; one in a container reaches `web` over the docker
+      # network and never used the host port at all.
+      set_env WEB_BIND 127.0.0.1
+      ok "port $WEB_PORT bound to localhost  ${DIM}(so nobody can sign in over plain HTTP)${N}"
+      warn "if your proxy runs on a DIFFERENT machine, set WEB_BIND=0.0.0.0 in .env." ;;
+    *)
+      set_env WEB_BIND '0.0.0.0'
+      warn "the public origin is not https://. Meta requires HTTPS for webhooks." ;;
+  esac
+  warn "nothing here terminates TLS — point your proxy at port $WEB_PORT."
+elif [ "$SHAPE" = local ]; then
+  set_env WEB_BIND '0.0.0.0'
+  ok "http://localhost:$WEB_PORT  ${DIM}(reachable from this machine only)${N}"
+fi
+
+GENERATED_PASSWORD=''
+if [ -z "$ADMIN_PASSWORD" ] && needs_value BOOTSTRAP_ADMIN_PASSWORD; then
+  ADMIN_PASSWORD=$(openssl rand -base64 15 | tr -d '\n=+/')
+  GENERATED_PASSWORD=1
+fi
+
+set_env WEB_PORT "$WEB_PORT"
+# CORS_ORIGIN is the one setting that may hold a list — backend/src/index.js
+# splits it on commas. CORS_EXTRA is set only when the given --url omits a port
+# the site is actually served on, where both spellings are legitimate and
+# refusing one produces a login failure reported as a wrong password.
+set_env CORS_ORIGIN "${PUBLIC_URL}${CORS_EXTRA:+,$CORS_EXTRA}"
+# NOT a cookie domain — util/session.js sets no cookie domain at all. This is the
+# fallback host for building absolute links (the public lead-form page, the MCP
+# connector URL) when a request arrives with no Host header. Those are built as
+# scheme://host, so a non-default port has to survive into it or the links 404.
+fg_host=${PUBLIC_URL#*://}; fg_host=${fg_host%%/*}
+set_env CADRECRM_DOMAIN "$fg_host"
+set_env BOOTSTRAP_ADMIN_EMAIL "$ADMIN_EMAIL"
+if [ -n "$ADMIN_PASSWORD" ]; then set_env BOOTSTRAP_ADMIN_PASSWORD "$ADMIN_PASSWORD"; fi
+# Written out rather than left to the compose default, so the version this
+# install runs is visible in .env and can be changed there. A hand-edited value
+# survives, because only an explicit pin overrides it.
+if [ "$MODE" = images ]; then
+  if [ -n "$PINNED_REF" ] && [ "$PINNED_REF" != main ]; then
+    IMAGE_TAG=$PINNED_REF
+  else
+    IMAGE_TAG=$(get_env CADREGROWTH_TAG)
+  fi
+  # A git ref is not an image tag. `refs/heads/my-branch` in this field makes
+  # `docker compose pull` fail with "invalid reference format", which names the
+  # format and not the field — so drop anything that cannot be a tag and fall
+  # back, instead of leaving somebody to hand-edit .env to escape it.
+  #
+  # A fully-qualified tag ref is the exception: `refs/tags/v1.0.0` is a real ref
+  # that raw.githubusercontent serves, so the FILES pin succeeds and only the
+  # image tag gets thrown away — leaving 1.0.0's compose file driving `latest`
+  # images. Both halves have to pin or neither, so unwrap it rather than let the
+  # sanitiser below decide it is unusable.
+  case "$IMAGE_TAG" in refs/tags/*) IMAGE_TAG=${IMAGE_TAG#refs/tags/} ;; esac
+  case "$IMAGE_TAG" in */*|*' '*|*:*) IMAGE_TAG='' ;; esac
+  IMAGE_TAG=${IMAGE_TAG:-latest}
+  # ⚠ Git tags this project are `v1.0.0`; the IMAGE tag is `1.0.0`. That is not
+  #   an inconsistency to tidy up — docker/metadata-action's
+  #   `type=semver,pattern={{version}}` strips the leading v, and that is the
+  #   conventional form for a container tag.
+  #
+  #   Passing the git ref through unchanged therefore asked for an image that has
+  #   never existed, and `docker compose pull` reports it as "manifest unknown" —
+  #   a message about a registry, from a value that came out of a git tag. It
+  #   broke EVERY pinned install (--version v1.0.0) and every install from the
+  #   release bundle, whose stamp records ref=v1.0.0. Found by installing from
+  #   the bundle rather than by reading either file.
+  case "$IMAGE_TAG" in
+    v[0-9]*) IMAGE_TAG=${IMAGE_TAG#v} ;;
+  esac
+  set_env CADREGROWTH_TAG "$IMAGE_TAG"
+fi
+ok "web on port $WEB_PORT, public URL $PUBLIC_URL"
+
+# ── 3. secrets ───────────────────────────────────────────────────────────────
+step 'Generating secrets'
+
+gen_if_needed() { # gen_if_needed <key> <generator-command> <description>
+  if needs_value "$1"; then
+    set_env "$1" "$(eval "$2")"
+    ok "generated $1  ${DIM}($3)${N}"
+  else
+    ok "kept existing $1"
+  fi
+}
+
+gen_if_needed CADRECRM_JWT_SECRET   "openssl rand -base64 48 | tr -d '\n=+/'" 'signs login cookies'
+# Must be exactly 32 bytes of hex — util/crypto.js derives an AES-256 key from it.
+gen_if_needed CADRECRM_ENCRYPTION_KEY "openssl rand -hex 32"                  'encrypts stored credentials'
+gen_if_needed META_WEBHOOK_VERIFY_TOKEN "openssl rand -hex 16"                'paste into Meta webhook setup'
+gen_if_needed POSTGRES_PASSWORD     "openssl rand -base64 24 | tr -d '\n=+/'" 'database'
+gen_if_needed MINIO_ROOT_PASSWORD   "openssl rand -base64 24 | tr -d '\n=+/'" 'object storage'
+
+# The backend prefers MINIO_SECRET_KEY over MINIO_ROOT_PASSWORD. If one is set
+# and the other is not, the server and client disagree and every upload fails
+# with SignatureDoesNotMatch — so keep the pair consistent, always.
+if [ -n "$(get_env MINIO_SECRET_KEY)" ]; then
+  set_env MINIO_SECRET_KEY "$(get_env MINIO_ROOT_PASSWORD)"
+  set_env MINIO_ACCESS_KEY "$(get_env MINIO_ROOT_USER)"
+  ok 'aligned MINIO_ACCESS_KEY/SECRET_KEY with the server credentials'
+fi
+
+chmod 600 "$ENV_FILE"
+ok '.env locked to owner-only (chmod 600)'
+
+# A 32-byte hex key is load-bearing: the wrong length fails at the first
+# credential write, long after install "succeeded".
+enc=$(get_env CADRECRM_ENCRYPTION_KEY)
+[ ${#enc} -eq 64 ] || die "CADRECRM_ENCRYPTION_KEY must be 64 hex characters (32 bytes); got ${#enc}."
+
+# ── 4. images ────────────────────────────────────────────────────────────────
+if [ "$MODE" = source ] && [ "$DO_BUILD" = 1 ]; then
+  step 'Building images (first run takes a few minutes)'
+  docker compose build || die "the image build failed — scroll up for the first error."
+  ok 'images built'
+elif [ "$MODE" = images ]; then
+  step "Downloading images ($IMAGE_TAG)"
+  pull_log=$(mktemp "${TMPDIR:-/tmp}/cadregrowth-pull.XXXXXX")
+  # ⚠ Compose writes its progress display to STDERR. Capturing stderr for the
+  #   error handler below therefore also hides every "Downloading 45%" line, and
+  #   this is the longest step of a first install — several hundred MB. The
+  #   screen sits on one heading for minutes with no cursor movement, which reads
+  #   as a hang, and the honest report from someone watching it is "it's stuck".
+  #
+  #   `tee` keeps both: the reader sees progress, the handler still gets the text
+  #   to match on. Piped rather than run through a process substitution so the
+  #   shell waits for tee to finish writing before the file is read below —
+  #   otherwise the error text is occasionally empty and the diagnosis is lost
+  #   exactly when it is needed. PIPESTATUS because the pipeline's own status is
+  #   tee's, which is always 0.
+  docker compose pull 2>&1 | tee "$pull_log"
+  pull_status=${PIPESTATUS[0]}
+  if [ "$pull_status" = 0 ]; then
+    rm -f "$pull_log"
+    ok 'images downloaded'
+  else
+    # Not re-printed: tee already put it on screen above. It is read here only
+    # so the cases below can turn Docker's wording into something actionable.
+    pull_err=$(cat "$pull_log"); rm -f "$pull_log"
+    case "$pull_err" in
+      # A GHCR package is created PRIVATE even when its repository is public, and
+      # the publish workflow cannot change that. So the first install from a
+      # fresh fork fails here with a bare 403 while CI reports a clean success —
+      # a green signal that does not cover the thing that broke.
+      *denied*|*403*|*nauthorized*)
+        die "the registry refused to hand over the images.
+
+  A GHCR package is private by default even when its repository is public.
+  Whoever owns $REPO needs to publish both packages, once:
+    Packages -> cadregrowth-backend, then cadregrowth-web
+    -> Package settings -> Change visibility -> Public" ;;
+      *manifest*nknown*|*ot\ found*|*invalid\ reference\ format*)
+        die "no images are published as '$IMAGE_TAG'.
+  Check the version, or leave --version off to take the current release." ;;
+      *)
+        die "could not download the images — the error above is Docker's." ;;
+    esac
+  fi
+fi
+
+# ── 5. start ─────────────────────────────────────────────────────────────────
+#
+# The tls profile bind-mounts ./caddy/Caddyfile. When that file is missing Docker
+# silently creates a DIRECTORY in its place and Caddy exits with "is a
+# directory", which describes the symptom and not one word of the cause.
+case ",$(get_env COMPOSE_PROFILES)," in
+  *,tls,*)
+    [ -f "$ROOT/caddy/Caddyfile" ] || die "HTTPS is on, but $ROOT/caddy/Caddyfile is missing.
+  Docker would create a directory at that path and Caddy would refuse to start.
+  Re-run $SELF, which fetches it." ;;
+esac
+
+step 'Starting services'
+docker compose up -d || die "docker compose up failed."
+
+# depends_on with a healthcheck already gates the backend, but the migration
+# step below runs from the HOST, so wait here too rather than racing it.
+printf '  waiting for postgres'
+for i in $(seq 1 60); do
+  if docker compose exec -T postgres pg_isready -q 2>/dev/null; then break; fi
+  printf '.'; sleep 2
+  if [ "$i" = 60 ]; then echo; die "postgres never became ready. Check: docker compose logs postgres"; fi
+done
+echo; ok 'postgres ready'
+
+# ── 6. migrations ────────────────────────────────────────────────────────────
+#
+# The backend image bakes in supabase/migrations and applies them from its
+# entrypoint before the app starts (AUTO_MIGRATE), on BOTH paths — so this is a
+# second way of doing it, not the only one. It is worth keeping on a checkout,
+# where the SQL on disk can be newer than the image that was just built. On the
+# images path there is no SQL on disk and no psql on the host, which is the
+# entire reason that path needs no repository.
+if [ "$MODE" = source ]; then
+  step 'Applying database migrations'
+  "$ROOT/scripts/migrate.sh" || die "migrations failed — the schema may be half-applied. Fix the SQL error above and re-run."
+
+  # The backend runs its ensure*Tables() bootstrap at startup and may have started
+  # before the schema existed. Restart it now so it comes up against a complete DB.
+  step 'Restarting the backend against the finished schema'
+  docker compose restart backend >/dev/null
+  ok 'backend restarted'
+else
+  ok 'migrations applied by the backend container at startup'
+fi
+
+# ── 7. verify ────────────────────────────────────────────────────────────────
+step 'Verifying'
+printf '  waiting for the web UI'
+code=''
+for i in $(seq 1 45); do
+  # `|| code=000` rather than `|| echo 000`: curl already prints 000 of its own
+  # when it cannot connect, so echoing another one concatenated them and the
+  # failure message read "HTTP 000000".
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${WEB_PORT}/" 2>/dev/null) || code=000
+  if [ "$code" = 200 ]; then break; fi
+  printf '.'; sleep 2
+done
+echo
+if [ "$code" = 200 ]; then
+  ok "web UI responding on http://localhost:${WEB_PORT}/"
+else
+  warn "the web UI returned HTTP ${code:-none} — check: docker compose logs web backend"
+fi
+
+# ── is the password about to be printed the one that actually works? ─────────
+#
+# ⚠ Until this ran, the summary reported the CONTENTS OF A FILE as though they
+#   were the state of the database. Those agree only while the admin row was
+#   created from that value: BOOTSTRAP_ADMIN_PASSWORD is applied when the users
+#   table is EMPTY (auth.js) and never read again. So it goes stale the moment
+#   somebody changes their password in Admin Settings, and it was never true at
+#   all if this database came from an earlier install.
+#
+#   Either way the reader gets a confident, wrong password, and the value being
+#   right there in .env makes the login screen look like the broken thing. This
+#   asks the API — the only opinion that counts — and reports the answer.
+#
+#   Over loopback, never the public URL: that may be https through a proxy this
+#   script cannot see, or a domain whose DNS points elsewhere. Neither has any
+#   bearing on whether the credentials are right. And with no Origin header,
+#   CORS is not involved, so this tests the password and nothing else.
+ADMIN_LOGIN=''   # ok | stale | unknown
+admin_pw=$(get_env BOOTSTRAP_ADMIN_PASSWORD)
+admin_em=$(get_env BOOTSTRAP_ADMIN_EMAIL); admin_em=${admin_em:-admin@example.com}
+if [ "$code" = 200 ] && [ -n "$admin_pw" ]; then
+  # A generated password can contain " or \; pasted raw it builds invalid JSON
+  # and the API answers 400, which reads exactly like a rejected password.
+  json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+  # The first admin is created during backend startup, so a moment after the web
+  # UI answers there may still be no user to log in as.
+  for i in $(seq 1 15); do
+    login_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+      -X POST "http://localhost:${WEB_PORT}/api/auth/login" \
+      -H 'Content-Type: application/json' \
+      -d "{\"email\":$(json_str "$admin_em"),\"password\":$(json_str "$admin_pw")}" 2>/dev/null) || login_code=000
+    case "$login_code" in
+      200) ADMIN_LOGIN=ok;     break ;;
+      401) ADMIN_LOGIN=stale;  break ;;
+      *)   ADMIN_LOGIN=unknown ;;
+    esac
+    sleep 2
+  done
+  case "$ADMIN_LOGIN" in
+    ok)    ok 'admin sign-in verified' ;;
+    stale) warn 'the password in .env is NOT accepted — see the note below' ;;
+    *)     warn "could not verify the admin password (HTTP ${login_code:-none})" ;;
+  esac
+fi
+
+# With --domain, "the app is up" is only half the answer: the address people
+# will actually type has to work too. Checking it here is the difference
+# between an install that prints an https:// URL and one that has verified it.
+if [ -n "$DOMAIN" ]; then
+  printf '  waiting for the certificate'
+  tls_code=''
+  # Up to ~2 minutes: issuance is usually seconds, but a cold ACME challenge on
+  # a busy server is slower, and this must not fail an install that will be
+  # fine a minute later.
+  for i in $(seq 1 40); do
+    # --insecure so a self-signed (TLS_EMAIL=internal) certificate still counts
+    # as "serving"; this is checking reachability, not trust.
+    tls_code=$(curl -sk -o /dev/null -w '%{http_code}' "https://${DOMAIN}/" 2>/dev/null) || tls_code=000
+    if [ "$tls_code" = 200 ]; then break; fi
+    printf '.'; sleep 3
+  done
+  echo
+  if [ "$tls_code" = 200 ]; then
+    ok "https://${DOMAIN}/ responding"
+    # Responding is not the same claim as trusted. The loop above passes on a
+    # self-signed certificate — a proxy's built-in default, or an ACME failure
+    # that left one behind — and every browser then shows a warning page, while
+    # Meta refuses the webhook outright. So ask the question a browser asks,
+    # once, WITHOUT -k. Only when a real certificate was the goal: TLS_EMAIL of
+    # "internal" means self-signed was the intention.
+    if [ "$TLS_EMAIL" != internal ]; then
+      if curl -s -o /dev/null --max-time 15 "https://${DOMAIN}/" 2>/dev/null; then
+        ok "certificate is publicly trusted"
+      else
+        warn "the certificate is NOT publicly trusted — a browser will warn, and"
+        warn "Meta will refuse a webhook on it. The site itself is serving fine."
+        warn "Usually one of:"
+        warn "  · issuance has not finished yet — re-check in a minute"
+        warn "  · the domain is proxied (Cloudflare's orange cloud), so the"
+        warn "    challenge never reaches this machine; use DNS-only while it issues"
+        warn "  · the Let's Encrypt account is rate-limited from earlier failures"
+        warn "Check with:  docker compose logs caddy | grep -i acme"
+      fi
+    fi
+  else
+    warn "https://${DOMAIN}/ returned HTTP ${tls_code:-none}."
+    warn "The app itself is up; this is the certificate or the DNS. Check:"
+    warn "  docker compose logs caddy"
+    warn "Most often: the domain does not point at this machine yet, or port 80"
+    warn "is blocked by a firewall so the certificate challenge cannot arrive."
+  fi
+fi
+
+# ── 8. credentials ───────────────────────────────────────────────────────────
+step 'Done'
+
+cat <<EOF
+
+  ${B}Cadre Growth OS is running.${N}
+
+    URL       ${PUBLIC_URL}
+    Sign in   ${ADMIN_EMAIL}
+    Install   ${PROJECT}   ${DIM}(this machine may hold several; commands below act on this one)${N}
+EOF
+
+# Where admin-password.sh lives, which differs between the two layouts. Defined
+# before the summary because the password lines below reference it.
+if [ "$MODE" = source ]; then PW_CMD='./scripts/admin-password.sh'
+else                          PW_CMD='./admin-password.sh'
+fi
+
+# ⚠ The password is reported from what the API ACCEPTED, not from what is in
+#   .env. Those are the same thing only while the admin row was created from
+#   that value, and the case where they differ is the one worth getting right:
+#   the file shows a real-looking password, the login refuses it, and the value
+#   being right there makes the app look broken rather than the state stale.
+#
+#   So a verified password is printed in full — including on a re-run, where the
+#   old text sent the reader to `grep` and left them to discover the mismatch at
+#   the login screen. A password that failed is not printed at all; printing it
+#   would be repeating the exact claim that just proved false.
+if [ "$ADMIN_LOGIN" = stale ]; then
+  printf "    Password  %sNOT the one in .env — that value is stale%s\n" "$R" "$N"
+  printf '              %sthe first admin was created with a different password, or it was%s\n' "$DIM" "$N"
+  printf '              %schanged in Admin Settings. Reset it (removes all accounts):%s\n' "$DIM" "$N"
+  printf '                %s --reset\n' "$PW_CMD"
+elif [ -n "$ADMIN_PASSWORD" ] && [ -n "$GENERATED_PASSWORD" ]; then
+  suffix='(generated — also stored in .env)'
+  [ "$ADMIN_LOGIN" = ok ] && suffix='(generated — sign-in verified)'
+  printf '    Password  %s%s%s   %s%s%s\n' "$B" "$ADMIN_PASSWORD" "$N" "$DIM" "$suffix" "$N"
+elif [ "$ADMIN_LOGIN" = ok ]; then
+  # Verified, so show it. On a re-run this is the value someone came back for,
+  # and having proved it works there is no reason to make them go and look.
+  printf '    Password  %s%s%s   %s(sign-in verified)%s\n' "$B" "$(get_env BOOTSTRAP_ADMIN_PASSWORD)" "$N" "$DIM" "$N"
+elif [ -n "$ADMIN_PASSWORD" ]; then
+  printf '    Password  %s(the one you supplied)%s\n' "$DIM" "$N"
+elif [ -n "$(get_env BOOTSTRAP_ADMIN_PASSWORD)" ]; then
+  # Present in .env but unverified — the site did not answer, so nothing can be
+  # claimed about it either way. Name the command that will settle it.
+  printf '    Password  %s(in .env, not verified — the site did not answer)%s\n' "$DIM" "$N"
+  printf '                %s\n' "$PW_CMD"
+else
+  echo '    Password  printed once in the backend log:'
+  echo '                docker compose logs backend | grep -A5 "FIRST-RUN ADMIN"'
+fi
+
+if [ "$MODE" = source ]; then
+  STOP_CMD='./scripts/down.sh'
+  UPGRADE_CMD='git pull && ./scripts/install.sh'
+  REMOVE_CMD="./scripts/uninstall.sh          ${DIM}(deletes all data)${N}"
+else
+  STOP_CMD='./down.sh'
+  # No `git pull` to precede it: the script re-downloads the compose file and
+  # its own copy, then pulls the images. Pinned installs stay pinned — the ref
+  # is remembered in .cadregrowth-install.
+  UPGRADE_CMD="./install.sh                   ${DIM}(or --version vX.Y.Z)${N}"
+  REMOVE_CMD="docker compose down -v          ${DIM}(deletes all data)${N}"
+fi
+
+cat <<EOF
+
+  ${DIM}Next steps${N}
+    Connect a WhatsApp number   Admin Settings → WhatsApp Accounts
+    Point Meta's webhook at     ${PUBLIC_URL}/api/webhook/whatsapp
+    with the verify token in    .env → META_WEBHOOK_VERIFY_TOKEN
+
+  ${DIM}Managing the stack${N} ${DIM}— run these from ${ROOT}; the directory is what picks the install${N}
+    Logs      docker compose logs -f backend
+    Start     ${STOP_CMD%down.sh}up.sh
+    Stop      ${STOP_CMD}
+    Upgrade   ${UPGRADE_CMD}
+    Password  ${PW_CMD}   ${DIM}(checks it works; --reset if it does not)${N}
+    Remove    ${REMOVE_CMD}
+    List all  docker compose ls
+
+  ${Y}Back up CADRECRM_ENCRYPTION_KEY from .env.${N} It decrypts every stored Meta,
+  Google and payment-gateway credential. Lose it and they must all be re-entered.
+
+EOF
